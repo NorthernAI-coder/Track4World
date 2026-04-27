@@ -411,20 +411,21 @@ def _evaluate_model(model, loader, batch_processor_fn, alignment_exp=10, aligned
         # --- B. Model Inference ---
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             output = model.infer_pair(
-                rgb_images, 
-                iters=4, 
-                sw=None, 
-                is_training=False, 
-                tracking3d=True, 
-                force_projection=True, 
+                rgb_images,
+                iters=4,
+                sw=None,
+                is_training=False,
+                tracking3d=True,
+                force_projection=True,
                 apply_mask=False,
+                use_da3_focal=False,
                 aligned_scene_flow=aligned_scene_flow
             )
 
         # --- C. Extract Predictions ---
         # 2D Motion (Absolute coordinates)
         pred_2d_motion = output[1]['flow_2d'][:, 0].permute(0, 2, 3, 1) # (B, H, W, 2)
-        
+
         # 3D Motion & Points
         pred_points = output[0]['points'][:, 0]
         pred_flow3d = output[1]['flow_3d'][:, 0]
@@ -663,6 +664,12 @@ if __name__ == "__main__":
         "--use_original_backbone",
         action="store_true",
         help="Use the original pretrained backbone instead of the modified one."
+    )
+
+    parser.add_argument(
+        "--metric_scale",
+        action="store_true",
+        help="Output 3D points and scene flow in metric scale (meters)."
     )
 
     parser.add_argument(

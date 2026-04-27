@@ -388,13 +388,14 @@ def test_track(model: torch.nn.Module, args: argparse.Namespace):
                     # Run Model Inference
                     if first_positive_ind < T - 1:
                         output, eval_dict = model.infer(
-                            rgbs[:, first_positive_ind:], 
-                            iters=4, 
-                            sw=None, 
-                            is_training=False, 
-                            tracking3d=True, 
-                            force_projection=True, 
-                            eval_dict=None 
+                            rgbs[:, first_positive_ind:],
+                            iters=4,
+                            sw=None,
+                            is_training=False,
+                            tracking3d=True,
+                            force_projection=True,
+                            use_da3_focal=False,
+                            eval_dict=None
                             # Note: In original code, eval_dict was passed as None here. 
                             # If state persistence is needed, check model implementation.
                         )
@@ -544,6 +545,12 @@ if __name__ == "__main__":
         "--use_original_backbone",
         action="store_true",
         help="Use the original pretrained backbone instead of the modified one."
+    )
+
+    parser.add_argument(
+        "--metric_scale",
+        action="store_true",
+        help="Output 3D tracks in metric scale (meters)."
     )
 
     parser.add_argument(

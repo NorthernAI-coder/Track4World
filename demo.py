@@ -260,7 +260,7 @@ def load_model(args, config: Dict) -> torch.nn.Module:
     if args.ckpt_init and os.path.exists(args.ckpt_init):
         logger.info(f'Loading weights from local file: {args.ckpt_init}...')
         state_dict = torch.load(args.ckpt_init, map_location='cpu')
-        model.load_state_dict(state_dict, strict=False)
+        model.load_pretrained_with_remap(state_dict)
         if args.use_original_backbone:
             model.switch_to_original_backbone()
     else:
@@ -271,18 +271,23 @@ def load_model(args, config: Dict) -> torch.nn.Module:
             url = "https://huggingface.co/cyun9286/Track4World/resolve/main/track4world_da3.pth"
         else:
             url = "https://huggingface.co/cyun9286/Track4World/resolve/main/track4world_moge.pth"
-            
+
         logger.info(f'Local checkpoint not found. Downloading from {url}...')
         state_dict = torch.hub.load_state_dict_from_url(
             url, map_location='cpu', check_hash=False
         )
-        model.load_state_dict(state_dict, strict=False)
+        model.load_pretrained_with_remap(state_dict)
     
     model.cuda()
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
-    
+
+    # Enable metric scale output if requested
+    if getattr(args, 'metric_scale', False):
+        model.use_metric_scale = True
+        logger.info('Metric scale output ENABLED.')
+
     logger.info('Model loaded and set to evaluation mode.')
     return model
 
@@ -1124,6 +1129,12 @@ def main():
         "--use_original_backbone",
         action="store_true",
         help="Use the original pretrained backbone instead of the modified one."
+    )
+    parser.add_argument(
+        "--metric_scale",
+        action="store_true",
+        help="Output point clouds and flow3d in metric scale (meters). "
+             "Requires DA3 nested backbone with metric depth."
     )
     # --- Inference Params ---
     parser.add_argument(

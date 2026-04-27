@@ -359,6 +359,11 @@ def get_shared_args():
         action="store_true",
         help="Use the original pretrained backbone instead of the modified one."
     )
+    parser.add_argument(
+        "--metric_scale",
+        action="store_true",
+        help="Output point clouds in metric scale (meters)."
+    )
     parser.add_argument("--chunk_size", type=int, default=130,
                         help="Temporal chunk size")
 
@@ -439,7 +444,8 @@ def run_evaluation_pipeline(args, task_config):
                 resolution_level=args.resolution_level,
                 num_tokens=args.num_tokens,
                 use_fp16=args.fp16,
-                current_batch_size=1
+                current_batch_size=1,
+                use_da3_focal=False,
             )
             
             # Extract specific key (points or depth) and move to CPU

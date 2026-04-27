@@ -627,6 +627,7 @@ class Track4World(nn.Module):
         self.num_tokens_range = num_tokens_range
         self.mask_threshold = mask_threshold
         self.use_model = use_model
+        self.use_metric_scale = False  # toggled externally via --metric_scale
         
         # --- Backbone (DINOv2) and Feature Extractor ---
         # Dynamically load the DINOv2 backbone from the local hub
@@ -676,10 +677,10 @@ class Track4World(nn.Module):
             self.flow_depth = 8
             
         elif use_model == 'depthanythingv3':
-            self.backbone = DepthAnything3.from_pretrained("depth-anything/DA3-GIANT-1.1")
+            self.backbone = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE-1.1")
             self.patch_start_idx = 0
             self.dim_feature = 1024
-            self.flow3d_dim = 256 
+            self.flow3d_dim = 256
             self.flow_depth = 4
 
         # --- Flow and Tracking Initialization ---
@@ -773,15 +774,48 @@ class Track4World(nn.Module):
         pretrained weights. The specific backbone architecture is selected
         based on the value of `self.use_model`.
         """
+        # Clear cached geometry state from any previous forward pass
+        for attr in ('_da3_focal', '_metric_scale'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
         if self.use_model == 'pi3':
             # Pi3X backbone pretrained on large-scale data
             self.backbone = Pi3X.from_pretrained("yyfz233/Pi3X")
 
         elif self.use_model == 'depthanythingv3':
-            # Depth Anything V3 backbone with GIANT configuration
+            # Depth Anything V3 backbone with Nested (metric) configuration
             self.backbone = DepthAnything3.from_pretrained(
-                "depth-anything/DA3-GIANT-1.1"
+                "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
             )
+
+    def load_pretrained_with_remap(self, state_dict):
+        """
+        Load track4world checkpoint weights with key remapping for nested DA3.
+
+        The original track4world_da3.pth stores DA3 backbone weights under
+        'backbone.model.<key>' (single-branch DepthAnything3Net). When using
+        the nested model (DA3NESTED-GIANT-LARGE), the anyview branch keys
+        become 'backbone.model.da3.<key>'. This method remaps accordingly.
+        The metric branch (backbone.model.da3_metric.*) retains its own
+        pretrained weights loaded via from_pretrained.
+        """
+        if self.use_model != 'depthanythingv3':
+            return self.load_state_dict(state_dict, strict=False)
+
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if (k.startswith('backbone.model.')
+                    and not k.startswith('backbone.model.da3.')
+                    and not k.startswith('backbone.model.da3_metric.')):
+                new_key = k.replace('backbone.model.', 'backbone.model.da3.', 1)
+                new_state_dict[new_key] = v
+            else:
+                new_state_dict[k] = v
+
+        missing, unexpected = self.load_state_dict(new_state_dict, strict=False)
+        return missing, unexpected
+
     def init_weights(self):
         """Initialize backbone weights from DINOv2 hub."""
         state_dict = torch.hub.load('facebookresearch/dinov2', self.encoder, pretrained=True).state_dict()
@@ -915,9 +949,18 @@ class Track4World(nn.Module):
                 global_features = [results['feats'][..., -self.dim_feature:]]
                 mask = results["depth_conf"].transpose(0, 1)
                 self.mask_threshold = 2
-                
-                # Scale normalization
+
+                # Save DA3 intrinsics as normalized focal for downstream use.
+                # normalized_focal = fx_px * 2 / diagonal_pixels
+                da3_intrinsics = results["intrinsics"]  # (B, T, 3, 3)
+                fx_px = da3_intrinsics[..., 0, 0].mean()
+                H14, W14 = results["depth"].shape[-2:]
+                diag = (H14 ** 2 + W14 ** 2) ** 0.5
+                self._da3_focal = (fx_px * 2 / diag).detach()
+
+                # Scale normalization (save metric scale for recovery)
                 scale = torch.norm(points, dim=1).mean()
+                self._metric_scale = scale.detach()
                 points = points / (scale + 1e-6)
                 world_points = world_points / (scale + 1e-6)
                 camera_poses[..., :3, 3] /= (scale + 1e-6)
@@ -957,7 +1000,8 @@ class Track4World(nn.Module):
                 'points': points_out.reshape(current_batch_size, T, original_height, original_width, 3),
                 'world_points': world_points_out.reshape(current_batch_size, T, original_height, original_width, 3),
                 'mask': mask.reshape(current_batch_size, T, original_height, original_width),
-                'camera_poses': camera_poses.reshape(current_batch_size, T, 4, 4)
+                'camera_poses': camera_poses.reshape(current_batch_size, T, 4, 4),
+                'metric_scale': getattr(self, '_metric_scale', None),
             }
 
         # -----------------------------------------
@@ -1408,31 +1452,47 @@ class Track4World(nn.Module):
         images = (images - self.image_mean) / self.image_std
 
         T_bak = T
-        # Pad temporal dimension for windowing
-        images, T, indices = self.get_T_padded_images(
-            images, T, S, is_training, stride
+        # Compute padding indices WITHOUT padding images — backbone should
+        # only see real frames.  Features will be padded after extraction.
+        _, _, indices = self.get_T_padded_images(
+            images, T, S, is_training, stride, pad=False
         )
+        T_padded = (indices[-1] + S) if indices is not None else T
         assert stride <= S // 2
 
         images = images.contiguous()
-        images_ = images.reshape(B * T, 3, H, W)
+        images_ = images.reshape(B * T_bak, 3, H, W)
         padder = InputPadder(images_.shape)
         images_ = padder.pad(images_)[0]
-        
+
         _, _, H_pad, W_pad = images_.shape
         C_flow, H8, W8 = self.flow_dim, H_pad // 8, W_pad // 8
         C_ctx = 128
-        
+
         # Feature Extraction or Retrieval from Cache
         if eval_dict is None:
-            (fmaps, ctxfeats, fmaps3d_detail, pms, 
+            (fmaps, ctxfeats, fmaps3d_detail, pms,
              points, masks, world_points, camera_poses) = self.get_fmaps(
-                images_, B, T, sw, is_training
+                images_, B, T_bak, sw, is_training
             )
-            fmaps = fmaps.to(dtype).reshape(B, T, C_flow, H8, W8)
-            fmaps3d_detail = fmaps3d_detail.to(dtype).reshape(B, T, self.flow3d_dim, H8, W8)
-            ctxfeats = ctxfeats.to(dtype).reshape(B, T, C_ctx, H8, W8)
-            pms = pms.to(dtype).reshape(B, T, 3, H8, W8)
+            fmaps = fmaps.to(dtype).reshape(B, T_bak, C_flow, H8, W8)
+            fmaps3d_detail = fmaps3d_detail.to(dtype).reshape(B, T_bak, self.flow3d_dim, H8, W8)
+            ctxfeats = ctxfeats.to(dtype).reshape(B, T_bak, C_ctx, H8, W8)
+            pms = pms.to(dtype).reshape(B, T_bak, 3, H8, W8)
+
+            # Pad features in time dimension to match T_padded
+            Tpad = T_padded - T_bak
+            if Tpad > 0:
+                fmaps = torch.cat([fmaps, fmaps[:, -1:].expand(-1, Tpad, -1, -1, -1)], dim=1)
+                fmaps3d_detail = torch.cat([fmaps3d_detail, fmaps3d_detail[:, -1:].expand(-1, Tpad, -1, -1, -1)], dim=1)
+                ctxfeats = torch.cat([ctxfeats, ctxfeats[:, -1:].expand(-1, Tpad, -1, -1, -1)], dim=1)
+                pms = torch.cat([pms, pms[:, -1:].expand(-1, Tpad, -1, -1, -1)], dim=1)
+                points = torch.cat([points, points[-1:].expand(Tpad, -1, -1, -1)], dim=0)
+                masks = torch.cat([masks, masks[-1:].expand(Tpad, -1, -1, -1)], dim=0)
+                world_points = torch.cat([world_points, world_points[-1:].expand(Tpad, -1, -1, -1)], dim=0)
+                camera_poses = torch.cat([camera_poses, camera_poses[-1:].expand(Tpad, -1, -1)], dim=0)
+
+            T = T_padded
             
             dict1 = {
                 'fmaps': fmaps, 'ctxfeats': ctxfeats, 
@@ -1982,8 +2042,8 @@ class Track4World(nn.Module):
     # --- Inference Wrappers ---
     @torch.inference_mode()
     def infer_pure_point(
-        self, 
-        image: torch.Tensor, 
+        self,
+        image: torch.Tensor,
         fov_x: Union[Number, torch.Tensor] = None,
         resolution_level: int = 9,
         num_tokens: Optional[int] = None,
@@ -1993,6 +2053,7 @@ class Track4World(nn.Module):
         current_batch_size: int = 4,
         local: bool = False,
         no_shift: bool = False,
+        use_da3_focal: bool = True,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         User-friendly inference function for point cloud estimation.
@@ -2057,21 +2118,29 @@ class Track4World(nn.Module):
             points, mask = points.float(), mask.float()
             mask_binary = mask > self.mask_threshold
 
+            # Restore metric scale BEFORE focal/shift recovery
+            _ms = getattr(self, '_metric_scale', None) if self.use_metric_scale else None
+            if _ms is not None:
+                points = points * _ms
+
             # --- Focal Length & Depth Shift Recovery ---
-            # 'local' usually refers to frame-wise recovery; 
-            # 'global' refers to sequence-wide consistency.
+            # DA3 backbone: use the known focal directly, no shift needed
+            # (DA3 intrinsics are accurate regardless of metric scale mode).
+            # Other backbones: estimate from point cloud.
+            _da3_f = getattr(self, '_da3_focal', None) if use_da3_focal else None
             if local:
-                if fov_x is None:
+                if _da3_f is not None:
+                    focal = _da3_f.expand(points.shape[0])
+                    shift = torch.zeros_like(focal)
+                elif fov_x is None:
                     focal, shift = recover_focal_shift(points, mask_binary)
                 else:
-                    # Calculate focal from FoV: f = 0.5 * w / tan(fov/2)
                     fov_rad = torch.deg2rad(torch.as_tensor(fov_x, device=points.device))
                     focal_val = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / \
                                 torch.tan(fov_rad / 2)
-                    
                     focal = focal_val[None].expand(points.shape[0]) if focal_val.ndim == 0 else focal_val
                     _, shift = recover_focal_shift(points, mask_binary, focal=focal)
-                
+
                 # Derive focal components
                 norm_factor = 0.5 * (1 + aspect_ratio ** 2) ** 0.5
                 fx, fy = focal * norm_factor / aspect_ratio, focal * norm_factor
@@ -2080,7 +2149,10 @@ class Track4World(nn.Module):
 
             else:
                 # Global Recovery (Optimized across temporal dimension)
-                if fov_x is None:
+                if _da3_f is not None:
+                    focal = _da3_f.expand(points.shape[0])
+                    shift = torch.zeros(points.shape[0], device=points.device, dtype=points.dtype)
+                elif fov_x is None:
                     if no_shift:
                         focal = recover_global_focal(points, mask_binary)
                         shift = torch.zeros_like(points[..., 0, 0, 0])
@@ -2090,9 +2162,12 @@ class Track4World(nn.Module):
                     fov_rad = torch.deg2rad(torch.as_tensor(fov_x, device=points.device))
                     focal_val = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / \
                                 torch.tan(fov_rad / 2)
-                    
                     focal = focal_val[None].expand(points.shape[0]) if focal_val.ndim == 0 else focal_val
-                    _, shift = recover_global_focal_shift(points, mask_binary, focal=focal)
+
+                    if no_shift:
+                        shift = torch.zeros_like(points[..., 0, 0, 0])
+                    else:
+                        _, shift = recover_global_focal_shift(points, mask_binary, focal=focal)
 
                 norm_factor = 0.5 * (1 + aspect_ratio ** 2) ** 0.5
                 fx, fy = focal * norm_factor / aspect_ratio, focal * norm_factor
@@ -2138,20 +2213,21 @@ class Track4World(nn.Module):
 
     @torch.inference_mode()
     def infer(
-        self, 
-        images, 
-        iters=4, 
-        sw=None, 
-        is_training=False, 
-        window_len=None, 
-        stride=None, 
-        tracking3d=False, 
+        self,
+        images,
+        iters=4,
+        sw=None,
+        is_training=False,
+        window_len=None,
+        stride=None,
+        tracking3d=False,
         apply_mask: bool = False,
-        force_projection: bool = True, 
-        use_fp16: bool = True, 
+        force_projection: bool = True,
+        use_fp16: bool = True,
         current_batch_size: int = 4,
-        local: bool = False, 
+        local: bool = False,
         no_shift: bool = False,
+        use_da3_focal: bool = True,
         eval_dict=None
     ) -> Dict[str, torch.Tensor]:
         """
@@ -2230,16 +2306,34 @@ class Track4World(nn.Module):
             # Ensure that all tensors participating in geometric computation
             # are promoted to float16 for numerical stability.
             points, mask = map(
-                lambda x: x.float() if isinstance(x, torch.Tensor) else x, 
+                lambda x: x.float() if isinstance(x, torch.Tensor) else x,
                 [points, mask]
             )
-            
+
             # Threshold the soft mask to obtain a binary validity mask.
             mask_binary = mask > self.mask_threshold
-            
-            # Estimate global focal length and depth shift from valid 3D points.
-            # This step recovers metric scale and camera intrinsics.
-            focal, shift = recover_global_focal_shift(points, mask_binary)
+
+            # ---------------------------------------------------------
+            # Restore metric scale BEFORE focal/shift recovery so that
+            # all downstream geometry lives in metric (meter) space.
+            # ---------------------------------------------------------
+            _ms = getattr(self, '_metric_scale', None) if self.use_metric_scale else None
+            if _ms is not None:
+                points = points * _ms
+                flow3d = flow3d * _ms
+                world_points = world_points * _ms
+                camera_poses = camera_poses.clone()
+                camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * _ms
+
+            # Recover focal length and depth shift.
+            # DA3: use the known focal directly, no shift needed.
+            # Other backbones: estimate both from the point cloud.
+            _da3_f = getattr(self, '_da3_focal', None) if use_da3_focal else None
+            if _da3_f is not None:
+                focal = _da3_f.expand(points.shape[0])
+                shift = torch.zeros(points.shape[0], device=points.device, dtype=points.dtype)
+            else:
+                focal, shift = recover_global_focal_shift(points, mask_binary)
 
             # Construct camera intrinsics assuming a normalized principal point.
             fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
@@ -2276,27 +2370,28 @@ class Track4World(nn.Module):
 
             # Store reconstructed scene geometry and camera information.
             return_dict.append({
-                'points': points, 
-                'intrinsics': intrinsics, 
-                'depth': depth, 
-                'mask': mask_binary, 
-                'world_points': world_points, 
-                'camera_poses': camera_poses
+                'points': points,
+                'intrinsics': intrinsics,
+                'depth': depth,
+                'mask': mask_binary,
+                'world_points': world_points,
+                'camera_poses': camera_poses,
+                'metric_scale': getattr(self, '_metric_scale', None),
             })
-            
+
             # Compute forward (next-frame) depth from the predicted 3D scene flow.
             forward_depth = flow3d[..., 2] + shift[..., None, None, None].repeat(
                 1, flow3d.shape[1], 1, 1
             )
-            
+
             if force_projection:
                 # Normalize pixel coordinates before unprojection.
                 flow2d_c[..., 0] /= flow2d_c.shape[-2]
                 flow2d_c[..., 1] /= flow2d_c.shape[-3]
-                
+
                 # Unproject 2D flow + depth to obtain metric 3D flow points.
                 points_f = utils3d.torch.unproject_cv(
-                    flow2d_c, forward_depth, 
+                    flow2d_c, forward_depth,
                     intrinsics=intrinsics[..., None, :, :], use_ray=False
                 )
             else:
@@ -2309,35 +2404,37 @@ class Track4World(nn.Module):
             # Restore pixel-scale coordinates after unprojection.
             flow2d_c[..., 0] *= flow2d_c.shape[-2]
             flow2d_c[..., 1] *= flow2d_c.shape[-3]
-            
+
             # Store motion-related outputs.
             return_dict.append({
-                'flow_3d': points_f, 
-                'flow_2d': flow2d, 
-                'visconf_maps_e': visconf_maps_e, 
-                'intrinsics': intrinsics, 
-                'depth': forward_depth, 
-                'mask': mask_binary
+                'flow_3d': points_f,
+                'flow_2d': flow2d,
+                'visconf_maps_e': visconf_maps_e,
+                'intrinsics': intrinsics,
+                'depth': forward_depth,
+                'mask': mask_binary,
+                'metric_scale': getattr(self, '_metric_scale', None),
             })
 
         return return_dict, eval_dict
 
     @torch.inference_mode()
     def infer_pair(
-        self, 
-        images, 
-        iters=4, 
-        sw=None, 
-        is_training=False, 
-        window_len=None, 
-        stride=None, 
-        tracking3d=False, 
+        self,
+        images,
+        iters=4,
+        sw=None,
+        is_training=False,
+        window_len=None,
+        stride=None,
+        tracking3d=False,
         apply_mask: bool = False,
-        force_projection: bool = True, 
-        use_fp16: bool = True, 
+        force_projection: bool = True,
+        use_fp16: bool = True,
         current_batch_size: int = 4,
-        local: bool = False, 
-        no_shift: bool = False, 
+        local: bool = False,
+        no_shift: bool = False,
+        use_da3_focal: bool = True,
         aligned_scene_flow: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -2465,18 +2562,36 @@ class Track4World(nn.Module):
 
             # Ensure float precision for all geometric tensors
             points, mask = map(
-                lambda x: x.float() if isinstance(x, torch.Tensor) else x, 
+                lambda x: x.float() if isinstance(x, torch.Tensor) else x,
                 [points, mask]
             )
 
             # Threshold soft mask to obtain binary validity mask
             mask_binary = mask > self.mask_threshold
-            
+
             # ---------------------------------------------------------
-            # Estimate global focal length and depth shift
-            # from the predicted point cloud
+            # Restore metric scale BEFORE focal/shift recovery so that
+            # all downstream geometry lives in metric (meter) space.
             # ---------------------------------------------------------
-            focal, shift = recover_global_focal_shift(points, mask_binary)
+            _ms = getattr(self, '_metric_scale', None) if self.use_metric_scale else None
+            if _ms is not None:
+                points = points * _ms
+                flow3d = flow3d * _ms
+                world_points = world_points * _ms
+                camera_poses = camera_poses.clone()
+                camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * _ms
+
+            # ---------------------------------------------------------
+            # Recover focal length and depth shift.
+            # DA3: use the known focal directly, no shift needed.
+            # Other backbones: estimate both from the point cloud.
+            # ---------------------------------------------------------
+            _da3_f = getattr(self, '_da3_focal', None) if use_da3_focal else None
+            if _da3_f is not None:
+                focal = _da3_f.expand(points.shape[0])
+                shift = torch.zeros(points.shape[0], device=points.device, dtype=points.dtype)
+            else:
+                focal, shift = recover_global_focal_shift(points, mask_binary)
 
             # Convert normalized focal to pixel-space fx / fy
             fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
@@ -2521,7 +2636,8 @@ class Track4World(nn.Module):
                 'depth': depth,
                 'mask': mask_binary,
                 'world_points': world_points,
-                'camera_poses': camera_poses
+                'camera_poses': camera_poses,
+                'metric_scale': getattr(self, '_metric_scale', None),
             })
             
             # ---------------------------------------------------------
@@ -2571,7 +2687,8 @@ class Track4World(nn.Module):
                 'visconf_maps_e': visconf_maps_e,
                 'intrinsics': intrinsics,
                 'depth': forward_depth,
-                'mask': mask_binary
+                'mask': mask_binary,
+                'metric_scale': getattr(self, '_metric_scale', None),
             })
 
         return return_dict
