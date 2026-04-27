@@ -182,6 +182,23 @@ python demo.py \
     --save_base_dir results/cat
 ```
 
+### 4. Metric Scale Output
+
+When using the DA3 backbone, you can enable `--metric_scale` to output all geometric results (`points`, `flow3d`, `world_points`, `camera_poses`) in metric (meter-level) coordinates:
+
+```bash
+python demo.py \
+    --mp4_path demo_data/cat.mp4 \
+    --coordinate world_depthanythingv3 \
+    --mode 3d_efep \
+    --Ts -1 \
+    --ckpt_init checkpoints/track4world_da3.pth \
+    --metric_scale \
+    --save_base_dir results/cat
+```
+
+> **Note:** Metric scale recovery is currently only supported with the DA3 backbone (`--use_model depthanythingv3`). MoGe and Pi3 backbones output in relative scale.
+
 ---
 
 ## ✨ Visualization
