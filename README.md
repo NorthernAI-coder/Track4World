@@ -16,8 +16,8 @@
   <sup>1</sup> HKUST </span> 
   <sup>2</sup> ARC Lab, Tencent PCG </span>
   <br>
+  <b>ECCV 2026</b>
 </p>
-
 <div align="center">
   <a href='https://arxiv.org/abs/2603.02573'><img src='https://img.shields.io/badge/arXiv-2603.02573-b31b1b.svg'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <a href='assets/arxiv_Track4World.pdf'><img src='https://img.shields.io/badge/Paper-PDF-red'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
