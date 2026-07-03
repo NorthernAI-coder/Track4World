@@ -1409,6 +1409,16 @@ class Track4World(nn.Module):
             del fmaps_chunk, ctxfeats_chunk, pms_chunk, fmaps3d_detail_chunk
             torch.cuda.empty_cache()
 
+        # The loop runs num_chunks = ceil((T-1)/chunk_size) times, but points/masks/
+        # world_points/camera_poses are split into ceil(T/chunk_size) chunks. When
+        # T ≡ 1 (mod chunk_size) the last chunk is dropped, leaving points one frame
+        # short (causes a shape mismatch in infer_pair). Append the leftover chunks.
+        for j in range(num_chunks, len(points_chunks)):
+            points_list.append(padder.unpad(points_chunks[j]))
+            masks_list.append(padder.unpad(masks_chunks[j]))
+            world_points_list.append(padder.unpad(world_points_chunks[j]))
+            camera_poses_list.append(camera_poses_chunks[j])
+
         # --- Aggregate Chunks into Final Tensors ---
         all_flow_preds, all_visconf_preds = [], []
         all_flow3d_preds = [] if tracking3d else None
